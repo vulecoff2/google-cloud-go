@@ -1062,7 +1062,7 @@ func (c *httpStorageClient) newRangeReaderXML(ctx context.Context, params *newRa
 	if err != nil {
 		return nil, err
 	}
-	return parseReadResponse(res, params, reopen)
+	return c.parseReadResponse(ctx, res, params, reopen)
 }
 
 func (c *httpStorageClient) newRangeReaderJSON(ctx context.Context, params *newRangeReaderParams, s *settings) (r *Reader, err error) {
@@ -1086,7 +1086,7 @@ func (c *httpStorageClient) newRangeReaderJSON(ctx context.Context, params *newR
 	if err != nil {
 		return nil, err
 	}
-	return parseReadResponse(res, params, reopen)
+	return c.parseReadResponse(ctx, res, params, reopen)
 }
 
 // httpInternalWriter writes data for an HTTP upload. For single-shot uploads,
@@ -1500,12 +1500,24 @@ func (c *httpStorageClient) DeleteNotification(ctx context.Context, bucket strin
 }
 
 type httpReader struct {
-	body     io.ReadCloser
-	seen     int64
-	reopen   func(seen int64) (*http.Response, error)
-	checkCRC bool   // should we check the CRC?
-	wantCRC  uint32 // the CRC32c value the server sent in the header
-	gotCRC   uint32 // running crc
+	body         io.ReadCloser
+	seen         int64
+	reopen       func(seen int64) (*http.Response, error)
+	checkCRC     bool   // should we check the CRC?
+	wantCRC      uint32 // the CRC32c value the server sent in the header
+	gotCRC       uint32 // running crc
+	delayManager *bucketDelayManager
+	bucket       string
+	metrics      *clientMetrics
+	target       string
+	ctx          context.Context
+}
+
+func (r *httpReader) wrapBody(body io.ReadCloser) io.ReadCloser {
+	if r.delayManager == nil || body == nil || body == emptyBody {
+		return body
+	}
+	return newStallReader(body, r.bucket, r.delayManager, r.metrics, r.target, r.ctx)
 }
 
 func (r *httpReader) Read(p []byte) (int, error) {
@@ -1545,7 +1557,10 @@ func (r *httpReader) Read(p []byte) (int, error) {
 			// reopen already retries
 			return n, err
 		}
-		r.body = res.Body
+		if res.Request != nil && res.Request.URL != nil {
+			r.target = stripPort(res.Request.URL.Host)
+		}
+		r.body = r.wrapBody(res.Body)
 	}
 	return n, nil
 }
@@ -1652,7 +1667,7 @@ func readerReopen(ctx context.Context, header http.Header, params *newRangeReade
 	}
 }
 
-func parseReadResponse(res *http.Response, params *newRangeReaderParams, reopen func(int64) (*http.Response, error)) (r *Reader, err error) {
+func (c *httpStorageClient) parseReadResponse(ctx context.Context, res *http.Response, params *newRangeReaderParams, reopen func(int64) (*http.Response, error)) (r *Reader, err error) {
 	defer func() {
 		if err != nil {
 			res.Body.Close()
@@ -1750,20 +1765,33 @@ func parseReadResponse(res *http.Response, params *newRangeReaderParams, reopen 
 		CRC32C:          crc,
 		Decompressed:    res.Uncompressed || uncompressedByServer(res),
 	}
+
+	var target string
+	if res.Request != nil && res.Request.URL != nil {
+		target = stripPort(res.Request.URL.Host)
+	}
+
+	hr := &httpReader{
+		reopen:       reopen,
+		wantCRC:      crc,
+		checkCRC:     checkCRC,
+		delayManager: c.dynamicReadReqStallTimeout,
+		bucket:       params.bucket,
+		metrics:      c.metrics,
+		target:       target,
+		ctx:          ctx,
+	}
+	hr.body = hr.wrapBody(body)
+
 	return &Reader{
 		Attrs:          attrs,
 		objectMetadata: &metadata,
 		size:           size,
 		remain:         remain,
 		checkCRC:       checkCRC,
-		reader: &httpReader{
-			reopen:   reopen,
-			body:     body,
-			wantCRC:  crc,
-			checkCRC: checkCRC,
-		},
-		bucket: params.bucket,
-		object: params.object,
+		reader:         hr,
+		bucket:         params.bucket,
+		object:         params.object,
 	}, nil
 }
 
@@ -1777,7 +1805,11 @@ func setHeadersFromCtx(ctx context.Context, header http.Header) {
 		// Merge x-goog-api-client values into a single space-separated value.
 		if strings.EqualFold(k, xGoogHeaderKey) {
 			alreadySetValues := header.Values(xGoogHeaderKey)
-			vals = append(vals, alreadySetValues...)
+			for _, v := range alreadySetValues {
+				if !strings.Contains(v, "gccl-invocation-id/") {
+					vals = append(vals, v)
+				}
+			}
 
 			if len(vals) > 0 {
 				xGoogHeader := vals[0]

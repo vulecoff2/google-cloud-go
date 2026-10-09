@@ -17,19 +17,23 @@ package storage
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log"
 	"math/rand"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3334,6 +3338,126 @@ func TestRetryReadStallEmulated(t *testing.T) {
 		t.Errorf("content does not match, got len %v, want len %v", buf.Len(), len(randomBytes3MiB))
 	}
 }
+
+// Test validates the retry for a mid-stream stalled read-request, when client is created with
+// WithReadStallTimeout.
+func TestRetryReadMidStreamStallEmulated(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if !isEmulatorEnvironmentSet() {
+		var attempts atomic.Int32
+		var sawRangeHeader atomic.Bool
+		crcVal := crc32.Checksum(randomBytes3MiB, crc32cTable)
+		crcB64 := base64.StdEncoding.EncodeToString([]byte{
+			byte(crcVal >> 24), byte(crcVal >> 16), byte(crcVal >> 8), byte(crcVal),
+		})
+
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			attempt := attempts.Add(1)
+			w.Header().Set("X-Goog-Generation", "12345")
+			w.Header().Set("X-Goog-Hash", "crc32c="+crcB64)
+
+			if attempt == 1 {
+				// First request: send 200 OK headers, write 2 MiB (2048 KiB), then stall.
+				w.Header().Set("Content-Length", strconv.Itoa(len(randomBytes3MiB)))
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(randomBytes3MiB[:2*1024*1024])
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				// Stall until client aborts the connection or test times out.
+				<-req.Context().Done()
+				return
+			}
+
+			// Reopened request after stall: must have Range: bytes=2097152-
+			if req.Header.Get("Range") == "bytes=2097152-" {
+				sawRangeHeader.Store(true)
+			}
+			rem := randomBytes3MiB[2*1024*1024:]
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", 2*1024*1024, len(randomBytes3MiB)-1, len(randomBytes3MiB)))
+			w.Header().Set("Content-Length", strconv.Itoa(len(rem)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(rem)
+		}))
+		defer ts.Close()
+
+		t.Setenv("STORAGE_EMULATOR_HOST", ts.URL)
+		client, err := NewClient(ctx, experimental.WithReadStallTimeout(
+			&experimental.ReadStallTimeoutConfig{
+				TargetPercentile: 0.99,
+				Min:              15 * time.Millisecond,
+			}))
+		if err != nil {
+			t.Fatalf("storage.NewClient: %v", err)
+		}
+		defer client.Close()
+
+		r, err := client.Bucket("test-bucket").Object("test-object").NewReader(ctx)
+		if err != nil {
+			t.Fatalf("NewReader: %v", err)
+		}
+		defer r.Close()
+
+		buf := &bytes.Buffer{}
+		if _, err := io.Copy(buf, r); err != nil {
+			t.Fatalf("io.Copy: %v", err)
+		}
+		if !sawRangeHeader.Load() {
+			t.Fatalf("expected second request with Range: bytes=2097152-, attempts=%d", attempts.Load())
+		}
+		if !bytes.Equal(buf.Bytes(), randomBytes3MiB) {
+			t.Fatalf("content does not match, got len %v, want len %v", buf.Len(), len(randomBytes3MiB))
+		}
+		return
+	}
+
+	// Initialize new storage.Client with ReadStallTimeout option. This cannot be initialized
+	// at the transportClient level so we must use NewClient for this test.
+	client, err := NewClient(ctx, experimental.WithReadStallTimeout(
+		&experimental.ReadStallTimeoutConfig{
+			TargetPercentile: 0.99,
+			Min:              10 * time.Millisecond,
+		}))
+	if err != nil {
+		t.Fatalf("storage.NewClient: %v", err)
+	}
+
+	// Setup bucket and upload object.
+	project := "fake-project"
+	bucket := fmt.Sprintf("http-bucket-%d", time.Now().Nanosecond())
+	if err := client.Bucket(bucket).Create(ctx, project, nil); err != nil {
+		t.Fatalf("client.Bucket.Create: %v", err)
+	}
+
+	name, _, _, err := createObjectWithContent(ctx, bucket, randomBytes3MiB)
+	if err != nil {
+		t.Fatalf("createObject: %v", err)
+	}
+
+	// Plant mid-stream stall for 10s after 2048K.
+	// The mid-stream stall detection should detect the stall, close the body,
+	// and transparently resume reading the remaining 1 MiB from offset 2048K.
+	instructions := map[string][]string{"storage.objects.get": {"stall-for-10s-after-2048K"}}
+	testID := createRetryTest(t, client.tc, instructions)
+
+	ctx = callctx.SetHeaders(ctx, "x-retry-test-id", testID)
+	r, err := client.Bucket(bucket).Object(name).NewReader(ctx)
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	defer r.Close()
+
+	buf := &bytes.Buffer{}
+	if _, err := io.Copy(buf, r); err != nil {
+		t.Fatalf("io.Copy: %v", err)
+	}
+	if !bytes.Equal(buf.Bytes(), randomBytes3MiB) {
+		t.Errorf("content does not match, got len %v, want len %v", buf.Len(), len(randomBytes3MiB))
+	}
+}
+
 
 func TestWriterChunkTransferTimeoutEmulated(t *testing.T) {
 	transportClientTest(skipGRPC("service is not implemented"), t, func(t *testing.T, ctx context.Context, project, bucket string, client storageClient) {
