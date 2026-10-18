@@ -53,10 +53,13 @@ type httpStorageClient struct {
 	xmlHost                    string
 	raw                        *raw.Service
 	scheme                     string
-	settings                   *settings
-	config                     *storageConfig
-	dynamicReadReqStallTimeout *bucketDelayManager
-	metrics                    *clientMetrics
+	settings                      *settings
+	config                        *storageConfig
+	dynamicReadReqStallTimeout    *bucketDelayManager
+	dynamicWriteBlockStallTimeout *bucketDelayManager
+	dynamicWriteRespStallTimeout  *bucketDelayManager
+	writeStallTransport           *writeStallTransport
+	metrics                       *clientMetrics
 	metricsCleanup             func()
 
 	// configFeatureAttributes tracks client-level features that are enabled for this
@@ -201,6 +204,32 @@ func newHTTPStorageClient(ctx context.Context, opts ...storageOption) (client st
 		if err != nil {
 			return nil, fmt.Errorf("creating dynamic-delay: %w", err)
 		}
+	}
+
+	if config.writeStallTimeoutConfig != nil {
+		wstConfig := config.writeStallTimeoutConfig
+		writeBlockDM, err := newBucketDelayManager(
+			wstConfig.TargetPercentile,
+			getDynamicReadReqIncreaseRateFromEnv(),
+			wstConfig.Min,
+			wstConfig.Min,
+			defaultDynamicReqdReqMaxTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("creating write-block dynamic-delay: %w", err)
+		}
+		writeRespDM, err := newBucketDelayManager(
+			wstConfig.TargetPercentile,
+			getDynamicReadReqIncreaseRateFromEnv(),
+			wstConfig.MinResponseDelay,
+			wstConfig.MinResponseDelay,
+			defaultDynamicReqdReqMaxTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("creating write-response dynamic-delay: %w", err)
+		}
+		c.dynamicWriteBlockStallTimeout = writeBlockDM
+		c.dynamicWriteRespStallTimeout = writeRespDM
+		c.writeStallTransport = newWriteStallTransport(hcClone.Transport, writeBlockDM, writeRespDM, clientMetrics, wstConfig.EnableTrueTimePart)
+		hcClone.Transport = c.writeStallTransport
 	}
 
 	c.xmlHost = u.Host
@@ -1181,8 +1210,9 @@ func (c *httpStorageClient) OpenWriter(params *openWriterParams, opts ...storage
 		if attrs.MD5 != nil {
 			rawObj.Md5Hash = base64.StdEncoding.EncodeToString(attrs.MD5)
 		}
+		eofTracker := &eofTrackingReader{r: pr}
 		call := c.raw.Objects.Insert(params.bucket, rawObj).
-			Media(pr, mediaOpts...).
+			Media(eofTracker, mediaOpts...).
 			Projection("full").
 			Context(params.ctx).
 			Name(params.attrs.Name)
@@ -1209,6 +1239,14 @@ func (c *httpStorageClient) OpenWriter(params *openWriterParams, opts ...storage
 			// retry attempt header injection with "client header" injection.
 			setClientHeader(call.Header())
 
+			retryAllowed := s.retry == nil || s.retry.policy != RetryNever
+			isSimpleWrite := params.chunkSize > 0 && eofTracker.sawEOF.Load()
+			writeStallEnabled := isSimpleWrite && retryAllowed && c.writeStallTransport != nil &&
+				isSafeCondsForWriteStall(params.conds, c.writeStallTransport.hasTrueTimeActive())
+			if writeStallEnabled {
+				call.Context(withSimpleWriteStallMeta(params.ctx, params.bucket))
+			}
+
 			// The internals that perform call.Do automatically retry both the initial
 			// call to set up the upload as well as calls to upload individual chunks
 			// for a resumable upload (as long as the chunk size is non-zero). Hence
@@ -1227,12 +1265,24 @@ func (c *httpStorageClient) OpenWriter(params *openWriterParams, opts ...storage
 					var retryFunc func(error) bool
 					if s.retry.shouldRetry != nil {
 						retryFunc = func(err error) bool {
+							if writeStallEnabled && errors.Is(err, errWriteStall) {
+								return true
+							}
 							return s.retry.shouldRetry(err, nil)
 						}
 					}
 					call.WithRetry(s.retry.backoff, retryFunc)
 				} else {
 					call.WithRetry(nil, nil)
+				}
+			} else if writeStallEnabled {
+				onlyStallRetry := func(err error) bool {
+					return errors.Is(err, errWriteStall)
+				}
+				if s.retry != nil {
+					call.WithRetry(s.retry.backoff, onlyStallRetry)
+				} else {
+					call.WithRetry(nil, onlyStallRetry)
 				}
 			}
 			resp, err = call.Do()

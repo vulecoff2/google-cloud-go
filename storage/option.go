@@ -86,9 +86,10 @@ type storageConfig struct {
 	metricExporter         *metric.Exporter
 	metricInterval         time.Duration
 	meterProvider          *metric.MeterProvider
-	manualReader           *metric.ManualReader
-	readStallTimeoutConfig *experimental.ReadStallTimeoutConfig
-	grpcBidiReads          bool
+	manualReader            *metric.ManualReader
+	readStallTimeoutConfig  *experimental.ReadStallTimeoutConfig
+	writeStallTimeoutConfig *WriteStallTimeoutConfig
+	grpcBidiReads           bool
 	grpcAppendableUploads  bool
 	grpcDirectPathEnforced bool
 }
@@ -275,6 +276,69 @@ type withReadStallTimeoutConfig struct {
 
 func (wrstc *withReadStallTimeoutConfig) ApplyStorageOpt(config *storageConfig) {
 	config.readStallTimeoutConfig = wrstc.readStallTimeoutConfig
+}
+
+const (
+	defaultDynamicWriteBlockMinTimeout = 500 * time.Millisecond
+	defaultDynamicWriteRespMinTimeout  = 750 * time.Millisecond
+)
+
+// WriteStallTimeoutConfig defines the dynamic timeouts used to detect stalls during
+// simple (multipart) uploads.
+type WriteStallTimeoutConfig struct {
+	// Min is the minimum duration of the timeout per 2 MiB write block.
+	// The default value is 500ms.
+	Min time.Duration
+
+	// MinResponseDelay is the minimum duration of the timeout waiting for the HTTP response
+	// headers after the request body has been written. If zero, defaults to 750ms (or Min if
+	// Min is explicitly set smaller than 750ms).
+	MinResponseDelay time.Duration
+
+	// TargetPercentile is the percentile to target for the dynamic timeout.
+	// The default value is 0.99.
+	TargetPercentile float64
+
+	// EnableTrueTimePart opts into splicing a 3rd multipart part carrying
+	// x-goog-gcs-deadline-offset-ms when the server emits X-Goog-Gcs-Base-Ts.
+	// Defaults to false so standard 2-part multipart uploads are used unless
+	// the server's 3-part TrueTime parser is enabled.
+	EnableTrueTimePart bool
+}
+
+// WithWriteStallTimeout is an option that may be passed to [NewClient].
+// It enables the client to detect and retry stalled simple (multipart) uploads on both
+// per-2MiB write block delays and post-EOF response delays.
+func WithWriteStallTimeout(wstc *WriteStallTimeoutConfig) option.ClientOption {
+	if wstc == nil {
+		wstc = &WriteStallTimeoutConfig{}
+	}
+	cfg := *wstc
+	if cfg.Min == 0 {
+		cfg.Min = defaultDynamicWriteBlockMinTimeout
+	}
+	if cfg.MinResponseDelay == 0 {
+		if cfg.Min < defaultDynamicWriteRespMinTimeout {
+			cfg.MinResponseDelay = cfg.Min
+		} else {
+			cfg.MinResponseDelay = defaultDynamicWriteRespMinTimeout
+		}
+	}
+	if cfg.TargetPercentile == 0 {
+		cfg.TargetPercentile = defaultTargetPercentile
+	}
+	return &withWriteStallTimeoutConfig{
+		writeStallTimeoutConfig: &cfg,
+	}
+}
+
+type withWriteStallTimeoutConfig struct {
+	internaloption.EmbeddableAdapter
+	writeStallTimeoutConfig *WriteStallTimeoutConfig
+}
+
+func (wwstc *withWriteStallTimeoutConfig) ApplyStorageOpt(config *storageConfig) {
+	config.writeStallTimeoutConfig = wwstc.writeStallTimeoutConfig
 }
 
 // WithGRPCBidiReads provides an [option.ClientOption] that may be passed to
