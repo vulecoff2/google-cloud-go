@@ -33,6 +33,8 @@ import (
 	"cloud.google.com/go/auth"
 	"cloud.google.com/go/iam/apiv1/iampb"
 	"cloud.google.com/go/internal/optional"
+	"github.com/google/uuid"
+	gax "github.com/googleapis/gax-go/v2"
 	"github.com/googleapis/gax-go/v2/callctx"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/googleapi"
@@ -47,16 +49,17 @@ import (
 // httpStorageClient is the HTTP-JSON API implementation of the transport-agnostic
 // storageClient interface.
 type httpStorageClient struct {
-	creds                      *auth.Credentials
-	hc                         *http.Client
-	xmlHost                    string
-	raw                        *raw.Service
-	scheme                     string
-	settings                   *settings
-	config                     *storageConfig
-	dynamicReadReqStallTimeout *bucketDelayManager
-	metrics                    *clientMetrics
-	metricsCleanup             func()
+	creds                       *auth.Credentials
+	hc                          *http.Client
+	xmlHost                     string
+	raw                         *raw.Service
+	scheme                      string
+	settings                    *settings
+	config                      *storageConfig
+	dynamicReadReqStallTimeout  *bucketDelayManager
+	dynamicReadBodyStallTimeout *bucketDelayManager
+	metrics                     *clientMetrics
+	metricsCleanup              func()
 
 	// configFeatureAttributes tracks client-level features that are enabled for this
 	// client instance.
@@ -198,24 +201,38 @@ func newHTTPStorageClient(ctx context.Context, opts ...storageOption) (client st
 		return nil, fmt.Errorf("supplied endpoint %q is not valid: %w", ep, err)
 	}
 
-	var bd *bucketDelayManager
+	var reqBD, bodyBD *bucketDelayManager
 	if config.readStallTimeoutConfig != nil {
 		drrstConfig := config.readStallTimeoutConfig
-		bd, err = newBucketDelayManager(
+		increaseRate := getDynamicReadReqIncreaseRateFromEnv()
+		initialTimeout := getDynamicReadReqInitialTimeoutSecFromEnv(drrstConfig.Min)
+		reqBD, err = newBucketDelayManager(
 			drrstConfig.TargetPercentile,
-			getDynamicReadReqIncreaseRateFromEnv(),
-			getDynamicReadReqInitialTimeoutSecFromEnv(drrstConfig.Min),
+			increaseRate,
+			initialTimeout,
 			drrstConfig.Min,
 			defaultDynamicReqdReqMaxTimeout)
 		if err != nil {
 			return nil, fmt.Errorf("creating dynamic-delay: %w", err)
+		}
+		if isHTTPMidStreamReadStallDevEnabled() {
+			bodyBD, err = newBucketDelayManager(
+				drrstConfig.TargetPercentile,
+				increaseRate,
+				initialTimeout,
+				drrstConfig.Min,
+				defaultDynamicReqdReqMaxTimeout)
+			if err != nil {
+				return nil, fmt.Errorf("creating body dynamic-delay: %w", err)
+			}
 		}
 	}
 
 	c.xmlHost = u.Host
 	c.raw = rawService
 	c.scheme = u.Scheme
-	c.dynamicReadReqStallTimeout = bd
+	c.dynamicReadReqStallTimeout = reqBD
+	c.dynamicReadBodyStallTimeout = bodyBD
 
 	return c, nil
 }
@@ -1046,7 +1063,11 @@ func (c *httpStorageClient) newRangeReaderXML(ctx context.Context, params *newRa
 	// earlier attempts (e.g. gccl-attempt-count/1) do not leak into later ones.
 	baseXGoogHeader := slices.Clone(req.Header.Values(xGoogHeaderKey))
 
-	reopen := readerReopen(ctx, req.Header, params, s,
+	var retryState *httpReaderRetryState
+	if c.dynamicReadBodyStallTimeout != nil {
+		retryState = newHTTPReaderRetryState(params, s)
+	}
+	reopen := readerReopen(ctx, req.Header, params, s, retryState,
 		func(ctx context.Context) (*http.Response, error) {
 			req.Header.Del(xGoogHeaderKey)
 			for _, v := range baseXGoogHeader {
@@ -1078,7 +1099,7 @@ func (c *httpStorageClient) newRangeReaderXML(ctx context.Context, params *newRa
 	if err != nil {
 		return nil, err
 	}
-	return parseReadResponse(res, params, reopen)
+	return c.parseReadResponse(ctx, res, params, reopen, retryState, true)
 }
 
 func (c *httpStorageClient) newRangeReaderJSON(ctx context.Context, params *newRangeReaderParams, s *settings) (r *Reader, err error) {
@@ -1094,7 +1115,7 @@ func (c *httpStorageClient) newRangeReaderJSON(ctx context.Context, params *newR
 		return nil, err
 	}
 
-	reopen := readerReopen(ctx, call.Header(), params, s, func(ctx context.Context) (*http.Response, error) { return call.Context(ctx).Download() },
+	reopen := readerReopen(ctx, call.Header(), params, s, nil, func(ctx context.Context) (*http.Response, error) { return call.Context(ctx).Download() },
 		func() error { return applyConds("NewReader", params.gen, params.conds, call) },
 		func() { call.Generation(params.gen) })
 
@@ -1102,7 +1123,7 @@ func (c *httpStorageClient) newRangeReaderJSON(ctx context.Context, params *newR
 	if err != nil {
 		return nil, err
 	}
-	return parseReadResponse(res, params, reopen)
+	return c.parseReadResponse(ctx, res, params, reopen, nil, false)
 }
 
 // httpInternalWriter writes data for an HTTP upload. For single-shot uploads,
@@ -1532,16 +1553,185 @@ func (c *httpStorageClient) DeleteNotification(ctx context.Context, bucket strin
 	}, s.retry, s.idempotent)
 }
 
+// httpReaderRetryState tracks retry budgets (maxAttempts, maxRetryDuration,
+// custom shouldRetry, and backoff) across both initial/reopen HTTP requests in
+// readerReopen and mid-stream body failures in httpReader.Read. Attempt counts
+// and backoff reset whenever forward byte progress is observed, mirroring
+// withProgressReset in invoke.go.
+type httpReaderRetryState struct {
+	retry            *retryConfig
+	noRetry          bool
+	bucket           string
+	object           string
+	invocationID     string
+	attempts         int
+	lastProgressSeen int64
+	offsetRetryStart time.Time
+	lastErr          error
+	initialBo        gax.Backoff
+	bo               gax.Backoff
+}
+
+func newHTTPReaderRetryState(params *newRangeReaderParams, s *settings) *httpReaderRetryState {
+	retry := defaultRetry
+	if s != nil && s.retry != nil {
+		retry = s.retry
+	}
+	noRetry := retry.policy == RetryNever || (retry.policy == RetryIdempotent && s != nil && !s.idempotent)
+	var initialBo gax.Backoff
+	if retry.backoff != nil {
+		initialBo = gax.Backoff{
+			Initial:    retry.backoff.Initial,
+			Max:        retry.backoff.Max,
+			Multiplier: retry.backoff.Multiplier,
+		}
+	}
+	return &httpReaderRetryState{
+		retry:        retry,
+		noRetry:      noRetry,
+		bucket:       params.bucket,
+		object:       params.object,
+		invocationID: uuid.New().String(),
+		initialBo:    initialBo,
+		bo:           initialBo,
+	}
+}
+
+// prepareMidStreamReopen enforces configured retry policy, attempt/duration
+// budgets, custom error predicates, and zero-progress backoff before reopening
+// a stalled or broken HTTP read stream.
+func (st *httpReaderRetryState) prepareMidStreamReopen(ctx context.Context, seen int64, err error) error {
+	if st.noRetry {
+		return err
+	}
+	if ctx != nil {
+		if ctxErr := ctx.Err(); errors.Is(ctxErr, context.Canceled) || errors.Is(ctxErr, context.DeadlineExceeded) {
+			return err
+		}
+	}
+
+	st.lastErr = err
+	madeProgress := seen > st.lastProgressSeen
+	if madeProgress {
+		st.lastProgressSeen = seen
+		st.attempts = 1
+		st.bo = st.initialBo
+		st.offsetRetryStart = time.Now()
+	} else if st.offsetRetryStart.IsZero() {
+		// Initial NewReader succeeded without header retries, so start the retry
+		// duration window on the first body failure rather than charging idle
+		// application time before the first Read.
+		st.offsetRetryStart = time.Now()
+	}
+	if st.retry.maxAttempts != nil && st.attempts >= *st.retry.maxAttempts {
+		return fmt.Errorf("storage: retry failed after %v attempts; last error: %w", *st.retry.maxAttempts, err)
+	}
+	if st.retry.maxRetryDuration != 0 && time.Since(st.offsetRetryStart) >= st.retry.maxRetryDuration {
+		return fmt.Errorf("storage: retry deadline of %s reached after %v attempts; last error: %w", st.retry.maxRetryDuration, st.attempts, err)
+	}
+	// Consult custom error predicates for mid-stream stall timeouts while
+	// preserving upstream reopen recovery for raw HTTP/2 body errors (such as
+	// http2.StreamError, GoAwayError, or "http2: client connection lost"), for
+	// which storage.ShouldRetry returns false.
+	if st.retry.shouldRetry != nil && errors.Is(err, context.DeadlineExceeded) {
+		retryCtx := &RetryContext{
+			Attempt:      st.attempts,
+			InvocationID: st.invocationID,
+			Operation:    "ReadObject",
+			Bucket:       st.bucket,
+			Object:       st.object,
+		}
+		if !st.retry.shouldRetry(err, retryCtx) {
+			return err
+		}
+		if st.retry.maxRetryDuration != 0 && time.Since(st.offsetRetryStart) >= st.retry.maxRetryDuration {
+			return fmt.Errorf("storage: retry deadline of %s reached after %v attempts; last error: %w", st.retry.maxRetryDuration, st.attempts, err)
+		}
+	}
+
+	// Reopen immediately when forward byte progress was made before the failure
+	// (matching gRPCReadObjectReader) for fast tail-stall recovery. When no byte
+	// progress occurred since the previous open/reopen, back off before retrying
+	// the same offset.
+	if !madeProgress {
+		pause := st.bo.Pause()
+		if st.retry.maxRetryDuration != 0 {
+			remDur := st.retry.maxRetryDuration - time.Since(st.offsetRetryStart)
+			if remDur <= 0 || pause >= remDur {
+				return fmt.Errorf("storage: retry deadline of %s reached after %v attempts; last error: %w", st.retry.maxRetryDuration, st.attempts, err)
+			}
+		}
+		sleepCtx := ctx
+		if sleepCtx == nil {
+			sleepCtx = context.Background()
+		}
+		backoffStart := time.Now()
+		ctxErr := gax.Sleep(sleepCtx, pause)
+		recordRetryBackoff(sleepCtx, backoffStart)
+		if ctxErr != nil {
+			return wrappedCallErr{ctxErr: ctxErr, wrappedErr: err}
+		}
+		if st.retry.maxRetryDuration != 0 && time.Since(st.offsetRetryStart) >= st.retry.maxRetryDuration {
+			return fmt.Errorf("storage: retry deadline of %s reached after %v attempts; last error: %w", st.retry.maxRetryDuration, st.attempts, err)
+		}
+	}
+	return nil
+}
+
 type httpReader struct {
-	body     io.ReadCloser
-	seen     int64
-	reopen   func(seen int64) (*http.Response, error)
-	checkCRC bool   // should we check the CRC?
-	wantCRC  uint32 // the CRC32c value the server sent in the header
-	gotCRC   uint32 // running crc
+	body         io.ReadCloser
+	seen         int64
+	wantBytes    int64
+	hasWantBytes bool
+	eof          bool
+	reopen       func(seen int64) (*http.Response, error)
+	checkCRC     bool   // should we check the CRC?
+	wantCRC      uint32 // the CRC32c value the server sent in the header
+	gotCRC       uint32 // running crc
+	retryState   *httpReaderRetryState
+	delayManager *bucketDelayManager
+	bucket       string
+	metrics      *clientMetrics
+	target       string
+	ctx          context.Context
+}
+
+func (r *httpReader) wrapBody(body io.ReadCloser) io.ReadCloser {
+	if r.delayManager == nil || body == nil || body == emptyBody {
+		return body
+	}
+	return newStallReader(r.ctx, body, r.bucket, r.delayManager, r.metrics, r.target)
+}
+
+func (r *httpReader) verifyCRC() error {
+	if r.checkCRC && r.gotCRC != r.wantCRC {
+		return fmt.Errorf("%w: bad CRC on read: got %d, want %d", errChecksumMismatch, r.gotCRC, r.wantCRC)
+	}
+	return nil
 }
 
 func (r *httpReader) Read(p []byte) (int, error) {
+	if r.eof {
+		if err := r.verifyCRC(); err != nil {
+			return 0, err
+		}
+		return 0, io.EOF
+	}
+	if len(p) > 0 && r.hasWantBytes && r.seen >= r.wantBytes {
+		// When stall detection wraps the response body, drain trailing EOF with
+		// a bounded timeout (without stall penalties) so healthy HTTP/2 streams
+		// consume END_STREAM cleanly and HTTP/1.1 chunked 206 keeps connections
+		// reusable, while stalled END_STREAM still finishes promptly as io.EOF.
+		if sr, ok := r.body.(*stallReader); ok {
+			sr.drainEOF()
+			r.eof = true
+			if err := r.verifyCRC(); err != nil {
+				return 0, err
+			}
+			return 0, io.EOF
+		}
+	}
+
 	n := 0
 	for len(p[n:]) > 0 {
 		m, err := r.body.Read(p[n:])
@@ -1553,32 +1743,58 @@ func (r *httpReader) Read(p []byte) (int, error) {
 		if err == nil {
 			return n, nil
 		}
-		if err == io.EOF {
+		if err == io.EOF || (r.hasWantBytes && r.seen >= r.wantBytes) {
+			r.eof = true
+			if err != io.EOF {
+				r.body.Close()
+			}
 			// Check CRC here. It would be natural to check it in Close, but
 			// everybody defers Close on the assumption that it doesn't return
 			// anything worth looking at.
-			if r.checkCRC {
-				if r.gotCRC != r.wantCRC {
-					return n, fmt.Errorf("%w: bad CRC on read: got %d, want %d", errChecksumMismatch,
-						r.gotCRC, r.wantCRC)
+			if crcErr := r.verifyCRC(); crcErr != nil {
+				return n, crcErr
+			}
+			return n, io.EOF
+		}
+
+		// Read failed (likely due to connection issues or a mid-stream stall),
+		// so close the current body and try to reopen from r.seen.
+		for {
+			// Close the current body before retrying. Otherwise we leave a
+			// connection open and the retry might fail due to quota issues.
+			r.body.Close()
+			if r.retryState != nil {
+				if retryErr := r.retryState.prepareMidStreamReopen(r.ctx, r.seen, err); retryErr != nil {
+					return n, retryErr
 				}
 			}
-			return n, err
-		}
-		// Read failed (likely due to connection issues), but we will try to reopen
-		// the pipe and continue. Send a ranged read request that takes into account
-		// the number of bytes we've already seen.
 
-		// Close the current body before retrying. Otherwise we leave a
-		// connection open and the retry might fail due to quota issues.
-		r.body.Close()
+			res, reopenErr := r.reopen(r.seen)
+			if reopenErr != nil {
+				// reopen already retries within the shared retryState budget.
+				return n, reopenErr
+			}
+			if res.Request != nil && res.Request.URL != nil && res.Request.URL.Host != "" {
+				r.target = stripPort(res.Request.URL.Host)
+			}
+			r.body = r.wrapBody(res.Body)
 
-		res, err := r.reopen(r.seen)
-		if err != nil {
-			// reopen already retries
-			return n, err
+			// With "Content-Encoding": "gzip" aka decompressive transcoding, GCS
+			// serves back the whole file regardless of the Range header as per:
+			//   https://cloud.google.com/storage/docs/transcoding#range
+			// Advance the wrapped body forward by r.seen bytes so stalls or stream
+			// errors during the discard are detected and retried cleanly.
+			if decompressiveTranscoding(res) && r.seen > 0 && res.StatusCode != http.StatusPartialContent {
+				if _, copyErr := io.CopyN(io.Discard, r.body, r.seen); copyErr != nil {
+					if errors.Is(copyErr, io.EOF) {
+						copyErr = io.ErrUnexpectedEOF
+					}
+					err = copyErr
+					continue
+				}
+			}
+			break
 		}
-		r.body = res.Body
 	}
 	return n, nil
 }
@@ -1599,7 +1815,7 @@ func setRangeReaderHeaders(h http.Header, params *newRangeReaderParams) error {
 
 // readerReopen initiates a Read with offset and length, assuming we
 // have already read seen bytes.
-func readerReopen(ctx context.Context, header http.Header, params *newRangeReaderParams, s *settings,
+func readerReopen(ctx context.Context, header http.Header, params *newRangeReaderParams, s *settings, retryState *httpReaderRetryState,
 	doDownload func(context.Context) (*http.Response, error), applyConditions func() error, setGeneration func()) func(int64) (*http.Response, error) {
 	return func(seen int64) (*http.Response, error) {
 		// If the context has already expired, return immediately without making a
@@ -1608,13 +1824,19 @@ func readerReopen(ctx context.Context, header http.Header, params *newRangeReade
 			return nil, err
 		}
 		start := params.offset + seen
+		header.Del("Range")
 		if params.length < 0 && start < 0 {
 			header.Set("Range", fmt.Sprintf("bytes=%d", start))
 		} else if params.length < 0 && start > 0 {
 			header.Set("Range", fmt.Sprintf("bytes=%d-", start))
 		} else if params.length > 0 {
 			// The end character isn't affected by how many bytes we've seen.
-			header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, params.offset+params.length-1))
+			// Guard against an inverted Range header (e.g. if decompressive
+			// transcoding served more bytes than params.length).
+			end := params.offset + params.length - 1
+			if start <= end {
+				header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+			}
 		}
 		// We wait to assign conditions here because the generation number can change in between reopen() runs.
 		if err := applyConditions(); err != nil {
@@ -1625,28 +1847,61 @@ func readerReopen(ctx context.Context, header http.Header, params *newRangeReade
 			setGeneration()
 		}
 
+		callRetry := s.retry
+		var reducedMaxAttempts, reducedMaxDuration bool
+		isInitialOpen := retryState == nil || retryState.attempts == 0
+		var openStart time.Time
+		if isInitialOpen {
+			openStart = time.Now()
+		} else if retryState.retry != nil && (retryState.retry.maxAttempts != nil || retryState.retry.maxRetryDuration != 0) {
+			callRetry = retryState.retry.clone()
+			if callRetry.maxAttempts != nil {
+				rem := *callRetry.maxAttempts - retryState.attempts
+				if rem <= 0 {
+					return nil, fmt.Errorf("storage: retry failed after %v attempts; last error: %w", *retryState.retry.maxAttempts, retryState.lastErr)
+				}
+				reducedMaxAttempts = true
+				callRetry.maxAttempts = &rem
+			}
+			if callRetry.maxRetryDuration != 0 {
+				remDur := callRetry.maxRetryDuration - time.Since(retryState.offsetRetryStart)
+				if remDur <= 0 {
+					return nil, fmt.Errorf("storage: retry deadline of %s reached after %v attempts; last error: %w", retryState.retry.maxRetryDuration, retryState.attempts, retryState.lastErr)
+				}
+				reducedMaxDuration = true
+				callRetry.maxRetryDuration = remDur
+			}
+		}
+
 		var err error
+		var lastAttemptErr error
 		var res *http.Response
 		err = run(ctx, func(ctx context.Context) error {
+			if retryState != nil {
+				retryState.attempts++
+			}
 			res, err = doDownload(ctx)
 			recordHTTPReadPayload(ctx, res, start, params.length)
 			if err != nil {
-				return formatObjectErr(err)
+				lastAttemptErr = formatObjectErr(err)
+				return lastAttemptErr
 			}
 
 			if res.StatusCode == http.StatusNotFound {
 				// this check is necessary only for XML
 				res.Body.Close()
-				return ErrObjectNotExist
+				lastAttemptErr = ErrObjectNotExist
+				return lastAttemptErr
 			}
 			if res.StatusCode < 200 || res.StatusCode > 299 {
 				body, _ := io.ReadAll(res.Body)
 				res.Body.Close()
-				return &googleapi.Error{
+				lastAttemptErr = &googleapi.Error{
 					Code:   res.StatusCode,
 					Header: res.Header,
 					Body:   string(body),
 				}
+				return lastAttemptErr
 			}
 
 			partialContentNotSatisfied :=
@@ -1656,16 +1911,8 @@ func readerReopen(ctx context.Context, header http.Header, params *newRangeReade
 
 			if partialContentNotSatisfied {
 				res.Body.Close()
-				return errors.New("storage: partial request not satisfied")
-			}
-
-			// With "Content-Encoding": "gzip" aka decompressive transcoding, GCS serves
-			// back the whole file regardless of the range count passed in as per:
-			//      https://cloud.google.com/storage/docs/transcoding#range,
-			// thus we have to manually move the body forward by seen bytes when a
-			// full-object (non-206) response is returned.
-			if decompressiveTranscoding(res) && seen > 0 && res.StatusCode != http.StatusPartialContent {
-				_, _ = io.CopyN(io.Discard, res.Body, seen)
+				lastAttemptErr = errors.New("storage: partial request not satisfied")
+				return lastAttemptErr
 			}
 
 			// If a generation hasn't been specified, and this is the first response we get, let's record the
@@ -1674,20 +1921,36 @@ func readerReopen(ctx context.Context, header http.Header, params *newRangeReade
 				gen64, err := strconv.ParseInt(res.Header.Get("X-Goog-Generation"), 10, 64)
 				if err != nil {
 					res.Body.Close()
-					return err
+					lastAttemptErr = err
+					return lastAttemptErr
 				}
 				params.gen = gen64
 			}
 			return nil
-		}, s.retry, s.idempotent, withOperation("ReadObject"), withBucket(params.bucket), withObject(params.object))
+		}, callRetry, s.idempotent, withOperation("ReadObject"), withBucket(params.bucket), withObject(params.object))
 		if err != nil {
+			if retryState != nil && !isInitialOpen && ctx.Err() == nil {
+				cause := lastAttemptErr
+				if cause == nil {
+					cause = retryState.lastErr
+				}
+				switch {
+				case reducedMaxAttempts && lastAttemptErr != nil && strings.HasPrefix(err.Error(), "storage: retry failed after "):
+					err = fmt.Errorf("storage: retry failed after %v attempts; last error: %w", *retryState.retry.maxAttempts, lastAttemptErr)
+				case reducedMaxDuration && cause != nil && (strings.HasPrefix(err.Error(), "storage: retry deadline of ") || (lastAttemptErr == nil && strings.HasPrefix(err.Error(), "storage: request not sent, "))):
+					err = fmt.Errorf("storage: retry deadline of %s reached after %v attempts; last error: %w", retryState.retry.maxRetryDuration, retryState.attempts, cause)
+				}
+			}
 			return nil, err
+		}
+		if retryState != nil && isInitialOpen && retryState.attempts > 1 {
+			retryState.offsetRetryStart = openStart
 		}
 		return res, nil
 	}
 }
 
-func parseReadResponse(res *http.Response, params *newRangeReaderParams, reopen func(int64) (*http.Response, error)) (r *Reader, err error) {
+func (c *httpStorageClient) parseReadResponse(ctx context.Context, res *http.Response, params *newRangeReaderParams, reopen func(int64) (*http.Response, error), retryState *httpReaderRetryState, enableStallDetection bool) (r *Reader, err error) {
 	defer func() {
 		if err != nil {
 			res.Body.Close()
@@ -1698,6 +1961,7 @@ func parseReadResponse(res *http.Response, params *newRangeReaderParams, reopen 
 		checkCRC    bool
 		crc         uint32
 		startOffset int64 // non-zero if range request.
+		rangeLen    int64 = -1
 	)
 	if res.StatusCode == http.StatusPartialContent {
 		cr := strings.TrimSpace(res.Header.Get("Content-Range"))
@@ -1705,9 +1969,10 @@ func parseReadResponse(res *http.Response, params *newRangeReaderParams, reopen 
 			err = fmt.Errorf("storage: invalid Content-Range %q", cr)
 			return nil, err
 		}
+		slashIndex := strings.LastIndex(cr, "/")
 		// Content range is formatted <first byte>-<last byte>/<total size>. We take
 		// the total size.
-		size, err = strconv.ParseInt(cr[strings.LastIndex(cr, "/")+1:], 10, 64)
+		size, err = strconv.ParseInt(cr[slashIndex+1:], 10, 64)
 		if err != nil {
 			err = fmt.Errorf("storage: invalid Content-Range %q: %w", cr, err)
 			return nil, err
@@ -1719,6 +1984,11 @@ func parseReadResponse(res *http.Response, params *newRangeReaderParams, reopen 
 			if err != nil {
 				err = fmt.Errorf("storage: invalid Content-Range %q: %w", cr, err)
 				return nil, err
+			}
+			if dashIndex+1 < slashIndex {
+				if endOffset, parseErr := strconv.ParseInt(cr[dashIndex+1:slashIndex], 10, 64); parseErr == nil && endOffset >= startOffset {
+					rangeLen = endOffset - startOffset + 1
+				}
 			}
 		}
 	} else {
@@ -1785,20 +2055,44 @@ func parseReadResponse(res *http.Response, params *newRangeReaderParams, reopen 
 		CRC32C:          crc,
 		Decompressed:    res.Uncompressed || uncompressedByServer(res),
 	}
+	var delayManager *bucketDelayManager
+	if enableStallDetection {
+		delayManager = c.dynamicReadBodyStallTimeout
+	}
+	target := stripPort(c.xmlHost)
+	if res.Request != nil && res.Request.URL != nil && res.Request.URL.Host != "" {
+		target = stripPort(res.Request.URL.Host)
+	}
+	wantBytes := remain
+	knownZero := params.length == 0 || res.Header.Get("Content-Length") != ""
+	if wantBytes < 0 && rangeLen >= 0 {
+		wantBytes = rangeLen
+	}
+	hasWantBytes := !attrs.Decompressed && !attrs.Unfinalized && (wantBytes > 0 || (wantBytes == 0 && knownZero))
+	hr := &httpReader{
+		reopen:       reopen,
+		wantBytes:    wantBytes,
+		hasWantBytes: hasWantBytes,
+		wantCRC:      crc,
+		checkCRC:     checkCRC,
+		retryState:   retryState,
+		delayManager: delayManager,
+		bucket:       params.bucket,
+		metrics:      c.metrics,
+		target:       target,
+		ctx:          ctx,
+	}
+	hr.body = hr.wrapBody(body)
+
 	return &Reader{
 		Attrs:          attrs,
 		objectMetadata: &metadata,
 		size:           size,
 		remain:         remain,
 		checkCRC:       checkCRC,
-		reader: &httpReader{
-			reopen:   reopen,
-			body:     body,
-			wantCRC:  crc,
-			checkCRC: checkCRC,
-		},
-		bucket: params.bucket,
-		object: params.object,
+		reader:         hr,
+		bucket:         params.bucket,
+		object:         params.object,
 	}, nil
 }
 

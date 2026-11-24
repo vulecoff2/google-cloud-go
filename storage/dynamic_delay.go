@@ -28,13 +28,15 @@ import (
 //
 // dynamicDelay is goroutine-safe.
 type dynamicDelay struct {
-	increaseFactor float64
-	decreaseFactor float64
-	minDelay       time.Duration
-	maxDelay       time.Duration
-	value          time.Duration
+	increaseFactor  float64
+	decreaseFactor  float64
+	minDelay        time.Duration
+	maxDelay        time.Duration
+	value           time.Duration
+	partialBytes    int64
+	partialDuration time.Duration
 
-	// Guards the value
+	// Guards the value and partial block accumulators.
 	mu *sync.RWMutex
 }
 
@@ -140,6 +142,32 @@ func (d *dynamicDelay) update(latency time.Duration) {
 		d.unsafeIncrease()
 	} else {
 		d.unsafeDecrease()
+	}
+}
+
+// recordPartialBlock accumulates active read bytes and duration from streams
+// that finish cleanly before reaching blockSize. Once cumulative bytes across
+// reads reach blockSize, it updates the delay with a blockSize-normalized
+// duration sample so workloads reading objects smaller than blockSize can still
+// decay after transient stalls.
+func (d *dynamicDelay) recordPartialBlock(bytes int64, duration time.Duration, blockSize int64) {
+	if bytes <= 0 || blockSize <= 0 {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.partialBytes += bytes
+	d.partialDuration += duration
+	for d.partialBytes >= blockSize {
+		sampleDuration := time.Duration(float64(d.partialDuration) * float64(blockSize) / float64(d.partialBytes))
+		if sampleDuration > d.value {
+			d.unsafeIncrease()
+		} else {
+			d.unsafeDecrease()
+		}
+		d.partialBytes -= blockSize
+		d.partialDuration -= sampleDuration
 	}
 }
 

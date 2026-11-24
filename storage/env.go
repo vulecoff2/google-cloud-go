@@ -31,6 +31,11 @@ const (
 	// storageOtelTracingDevVar is the environment variable that enables OTel tracing.
 	storageOtelTracingDevVar = "GO_STORAGE_DEV_OTEL_TRACING"
 
+	// storageMidStreamReadStallDevVar is the development environment variable that
+	// enables mid-stream HTTP XML read stall detection when WithReadStallTimeout
+	// is configured.
+	storageMidStreamReadStallDevVar = "GO_STORAGE_DEV_HTTP_MIDSTREAM_READ_STALL"
+
 	// storageBucketMetadataDisabledVar is the environment variable that disables
 	// Autorequester Bucket Metadata optimization.
 	storageBucketMetadataDisabledVar = "GO_OTEL_BUCKETMETADATA_DISABLED"

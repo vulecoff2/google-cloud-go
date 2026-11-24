@@ -79,6 +79,13 @@ func getDynamicReadReqInitialTimeoutSecFromEnv(defaultVal time.Duration) time.Du
 	return val
 }
 
+// isHTTPMidStreamReadStallDevEnabled checks the development flag until
+// mid-stream HTTP read stall detection is launched.
+// TODO: Remove development flag upon experimental launch.
+func isHTTPMidStreamReadStallDevEnabled() bool {
+	return os.Getenv(storageMidStreamReadStallDevVar) == "true"
+}
+
 // set through storageClientOptions.
 type storageConfig struct {
 	useJSONforReads        bool

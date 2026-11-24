@@ -3656,6 +3656,64 @@ func TestRetryReadStallEmulated(t *testing.T) {
 	checkRetryTestCompleted(t, testID)
 }
 
+// Test validates the retry for a mid-stream stalled read-request over HTTP XML,
+// when client is created with WithReadStallTimeout and the dev flag is enabled.
+func TestRetryReadMidStreamStallEmulated(t *testing.T) {
+	checkEmulatorEnvironment(t)
+	t.Setenv(storageMidStreamReadStallDevVar, "true")
+	setupCtx, setupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer setupCancel()
+
+	// Initialize new storage.Client with ReadStallTimeout option. This cannot be initialized
+	// at the transportClient level so we must use NewClient for this test.
+	client, err := NewClient(setupCtx, experimental.WithReadStallTimeout(
+		&experimental.ReadStallTimeoutConfig{
+			TargetPercentile: 0.99,
+			Min:              250 * time.Millisecond,
+		}))
+	if err != nil {
+		t.Fatalf("storage.NewClient: %v", err)
+	}
+	defer client.Close()
+
+	// Setup bucket and upload object.
+	project := "fake-project"
+	bucket := fmt.Sprintf("http-bucket-%d", time.Now().UnixNano())
+	if err := client.Bucket(bucket).Create(setupCtx, project, nil); err != nil {
+		t.Fatalf("client.Bucket.Create: %v", err)
+	}
+
+	name, _, _, err := createObjectWithContent(setupCtx, bucket, randomBytes3MiB)
+	if err != nil {
+		t.Fatalf("createObject: %v", err)
+	}
+
+	// Plant mid-stream stall for 3s after 16K (kept short per #20635 so stalled
+	// testbench workers release promptly; 16K streams in ~50ms on testbench
+	// before stalling). A 2.5s read deadline is shorter than the 3s stall,
+	// proving the stall was detected and retried rather than waited out.
+	instructions := map[string][]string{"storage.objects.get": {"stall-for-3s-after-16K"}}
+	testID := createRetryTest(t, client.tc, instructions)
+
+	readCtx, cancel := context.WithTimeout(setupCtx, 2500*time.Millisecond)
+	defer cancel()
+	readCtx = callctx.SetHeaders(readCtx, "x-retry-test-id", testID)
+	r, err := client.Bucket(bucket).Object(name).NewReader(readCtx)
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	defer r.Close()
+
+	buf := &bytes.Buffer{}
+	if _, err := io.Copy(buf, r); err != nil {
+		t.Fatalf("io.Copy: %v", err)
+	}
+	if !bytes.Equal(buf.Bytes(), randomBytes3MiB) {
+		t.Errorf("content does not match, got len %v, want len %v", buf.Len(), len(randomBytes3MiB))
+	}
+	checkRetryTestCompleted(t, testID)
+}
+
 // Test validates the retry for stalled read-requests over gRPC, for both the
 // ReadObject and BidiReadObject read paths, when the client is created with
 // WithReadStallTimeout.
